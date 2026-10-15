@@ -1,0 +1,24 @@
+[package]
+name = "kippers"
+version = "0.0.1"
+authors = ["Quedanomo"]
+edition = "2024"
+build = "build/build.rs"
+publish = false
+
+[lib]
+crate-type = ["rlib"]
+
+[profile.dev]
+opt-level = 3
+debug = true
+debug-assertions = true
+
+[profile.release]
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+
+[dependencies]
+libc = "0.2.175"
+

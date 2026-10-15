@@ -1,0 +1,609 @@
+use crate::{
+    lookup::{
+        attacks, between, bishop_attacks, cuckoo, cuckoo_a, cuckoo_b, h1, h2, king_attacks, knight_attacks,
+        pawn_attacks, ray_pass, rook_attacks,
+    },
+    setwise::{bishop_attacks_setwise, knight_attacks_setwise, pawn_attacks_setwise, rook_attacks_setwise},
+    types::{
+        Bitboard, Castling, CastlingKind, Color, File, Keys, Move, PAWN_HOME_RANK, PROMO_RANK, Piece, PieceType,
+        Square, ZOBRIST,
+    },
+};
+
+#[cfg(test)]
+mod tests;
+
+mod makemove;
+mod movegen;
+mod parser;
+mod see;
+
+/// Captures essential information needed to efficiently revert the board to
+/// a previous position after making a move.
+///
+/// Implements the `Copy` trait for efficient memory duplication via bitwise copying.
+#[derive(Copy, Clone, Default)]
+struct InternalState {
+    keys: Keys,
+    en_passant: Square,
+    castling: Castling,
+    fiftymove_clock: u8,
+    material: i32,
+    plies_from_null: usize,
+    repetition: i32,
+    captured: Piece,
+    piece_threats: [Bitboard; PieceType::NUM],
+    all_threats: Bitboard,
+    pinned: [Bitboard; Color::NUM],
+    pinners: [Bitboard; Color::NUM],
+    checkers: Bitboard,
+    checking_squares: [Bitboard; PieceType::NUM],
+}
+
+#[derive(Clone)]
+pub struct Board {
+    pieces: [Bitboard; PieceType::NUM],
+    colors: [Bitboard; Color::NUM],
+    mailbox: [Piece; Square::NUM],
+    state: InternalState,
+    state_stack: Vec<InternalState>,
+    halfmove_number: usize,
+    castling_rights: [u8; Square::NUM],
+    castling_path: [Bitboard; 16],
+    castling_threat: [Bitboard; 16],
+    castling_rooks: [Square; 16],
+    frc: bool,
+}
+
+impl Board {
+    pub fn starting_position() -> Self {
+        Self::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap()
+    }
+
+    pub const fn is_frc(&self) -> bool {
+        self.frc
+    }
+
+    pub const fn fullmove_number(&self) -> usize {
+        self.halfmove_number / 2
+    }
+
+    pub fn side_to_move(&self) -> Color {
+        Color::new((self.halfmove_number & 1) as u8)
+    }
+
+    pub fn fiftymove_clock_bucket(&self) -> usize {
+        (self.fiftymove_clock().saturating_sub(8) as usize / 8).min(15)
+    }
+
+    pub fn hash(&self) -> u64 {
+        // To mitigate Graph History Interaction (GHI) problems, the hash key is changed
+        // every 8 plies to distinguish between positions that would otherwise appear
+        // identical to the transposition table.
+        self.state.keys.full() ^ ZOBRIST.fiftymove_clock[self.fiftymove_clock_bucket()]
+    }
+
+    pub fn key_after(&self, mv: Move) -> u64 {
+        let from = mv.from();
+        let to = mv.to();
+        let piece = self.piece_on(from);
+        let captured = self.piece_on(to);
+
+        let mut key = self.state.keys.full() ^ ZOBRIST.side ^ ZOBRIST.pieces[piece][from] ^ ZOBRIST.pieces[piece][to];
+
+        if captured != Piece::None {
+            key ^= ZOBRIST.pieces[captured][to];
+        }
+
+        let fiftymove_clock = if captured != Piece::None || piece.piece_type() == PieceType::Pawn {
+            0
+        } else {
+            self.fiftymove_clock().saturating_add(1)
+        };
+        let bucket = (fiftymove_clock.saturating_sub(8) as usize / 8).min(15);
+
+        key ^ ZOBRIST.fiftymove_clock[bucket]
+    }
+
+    pub const fn pawn_key(&self) -> u64 {
+        self.state.keys.pawn()
+    }
+
+    pub const fn non_pawn_key(&self, color: Color) -> u64 {
+        self.state.keys.non_pawn(color)
+    }
+
+    pub const fn pinned(&self, color: Color) -> Bitboard {
+        self.state.pinned[color as usize]
+    }
+
+    pub const fn pinners(&self, color: Color) -> Bitboard {
+        self.state.pinners[color as usize]
+    }
+
+    pub const fn checking_squares(&self, pt: PieceType) -> Bitboard {
+        self.state.checking_squares[pt as usize]
+    }
+
+    pub const fn checkers(&self) -> Bitboard {
+        self.state.checkers
+    }
+
+    pub const fn all_threats(&self) -> Bitboard {
+        self.state.all_threats
+    }
+
+    pub const fn piece_threats(&self, pt: PieceType) -> Bitboard {
+        self.state.piece_threats[pt as usize]
+    }
+
+    pub fn prior_threats(&self) -> Bitboard {
+        debug_assert!(!self.state_stack.is_empty());
+        self.state_stack[self.state_stack.len() - 1].all_threats
+    }
+
+    pub const fn captured_piece(&self) -> Piece {
+        self.state.captured
+    }
+
+    pub const fn en_passant(&self) -> Square {
+        self.state.en_passant
+    }
+
+    pub const fn castling(&self) -> Castling {
+        self.state.castling
+    }
+
+    pub const fn fiftymove_clock(&self) -> u8 {
+        self.state.fiftymove_clock
+    }
+
+    pub const fn material(&self) -> i32 {
+        self.state.material
+    }
+
+    pub const fn in_check(&self) -> bool {
+        !self.state.checkers.is_empty()
+    }
+
+    pub fn colors(&self, color: Color) -> Bitboard {
+        self.colors[color]
+    }
+
+    pub fn pieces(&self, piece_type: PieceType) -> Bitboard {
+        self.pieces[piece_type]
+    }
+
+    pub fn pieces2(&self, piece_type1: PieceType, piece_type2: PieceType) -> Bitboard {
+        self.pieces[piece_type1] | self.pieces[piece_type2]
+    }
+
+    pub const fn colors_bbs(&self) -> [Bitboard; Color::NUM] {
+        self.colors
+    }
+
+    pub const fn pieces_bbs(&self) -> [Bitboard; PieceType::NUM] {
+        self.pieces
+    }
+
+    pub fn occupancies(&self) -> Bitboard {
+        self.colors(Color::White) | self.colors(Color::Black)
+    }
+
+    pub fn colored_pieces(&self, side: Color, piece_type: PieceType) -> Bitboard {
+        self.colors(side) & self.pieces(piece_type)
+    }
+
+    pub fn colored_pieces2(&self, side: Color, pt1: PieceType, pt2: PieceType) -> Bitboard {
+        self.colors(side) & (self.pieces(pt1) | self.pieces(pt2))
+    }
+
+    pub fn king_square(&self, color: Color) -> Square {
+        self.colored_pieces(color, PieceType::King).lsb()
+    }
+
+    pub fn type_on(&self, square: Square) -> PieceType {
+        self.mailbox[square].piece_type()
+    }
+
+    pub fn piece_on(&self, square: Square) -> Piece {
+        self.mailbox[square]
+    }
+
+    pub fn moved_piece(&self, mv: Move) -> Piece {
+        self.mailbox[mv.from()]
+    }
+
+    pub const fn set_frc(&mut self, frc: bool) {
+        self.frc = frc;
+    }
+
+    pub fn add_piece(&mut self, piece: Piece, square: Square) {
+        self.mailbox[square] = piece;
+        self.colors[piece.color()].set(square);
+        self.pieces[piece.piece_type()].set(square);
+        self.update_hash(piece, square);
+    }
+
+    pub fn remove_piece(&mut self, square: Square) -> Piece {
+        let piece = self.mailbox[square];
+        self.mailbox[square] = Piece::None;
+        self.colors[piece.color()].clear(square);
+        self.pieces[piece.piece_type()].clear(square);
+        self.update_hash(piece, square);
+        piece
+    }
+
+    pub fn update_hash(&mut self, piece: Piece, square: Square) {
+        self.state.keys.toggle(piece, square);
+    }
+
+    /// Checks for a material draw
+    pub fn draw_by_material(&self) -> bool {
+        let stm = self.side_to_move();
+        if (self.pieces(PieceType::Pawn) | self.pieces(PieceType::Rook) | self.pieces(PieceType::Queen)) != Bitboard(0)
+        {
+            return false;
+        }
+
+        let piece_count = self.occupancies().popcount();
+        if piece_count != 4 {
+            return piece_count < 4;
+        }
+
+        // Here on, there are exactly 2 non-king minors
+
+        // Here, each side has one minor
+        if self.colored_pieces2(stm, PieceType::Bishop, PieceType::Knight).popcount() == 1 {
+            //If a king is in a corner, don't auto draw.
+            return (Bitboard::CORNERS & self.pieces(PieceType::King)).is_empty();
+        }
+
+        if self.pieces(PieceType::Knight) != Bitboard(0) {
+            return false;
+        }
+
+        (self.pieces(PieceType::Bishop) & Bitboard::LIGHT_SQUARES).popcount() != 1
+    }
+
+    /// Checks if the position has repeated once earlier but strictly
+    /// after the root, or repeated twice before or at the root.
+    pub const fn draw_by_repetition(&self, ply: i32) -> bool {
+        self.state.repetition != 0 && self.state.repetition < ply
+    }
+
+    pub fn has_repeated(&self) -> bool {
+        let end = self.state.plies_from_null.min(self.fiftymove_clock() as usize);
+        std::iter::once(&self.state)
+            .chain(self.state_stack.iter().rev())
+            .take(end.saturating_sub(3))
+            .any(|s| s.repetition != 0)
+    }
+
+    pub fn draw_by_fifty_move_rule(&self) -> bool {
+        self.fiftymove_clock() >= 100 && (!self.in_check() || self.has_legal_moves())
+    }
+
+    /// Checks if the position is a known draw by material, fifty-move or repetition.
+    pub fn is_draw(&self, ply: isize) -> bool {
+        self.draw_by_material() || self.draw_by_fifty_move_rule() || self.draw_by_repetition(ply as i32)
+    }
+
+    /// Checks if the current position has a move that leads to a draw by repetition.
+    ///
+    /// This method uses a cuckoo hashing algorithm as described in M. N. J. van Kervinck's
+    /// paper to detect cycles one ply before they appear in the search of a game tree.
+    ///
+    /// <http://web.archive.org/web/20201107002606/https://marcelk.net/2013-04-06/paper/upcoming-rep-v2.pdf>
+    pub fn upcoming_repetition(&self, ply: usize) -> bool {
+        let half_moves = self.state.plies_from_null.min(self.fiftymove_clock() as usize);
+        if half_moves < 3 {
+            return false;
+        }
+
+        let current_key = self.state.keys.full();
+        let stack = &self.state_stack;
+        let len = stack.len();
+
+        let mut index = len - 1;
+        let mut other = current_key ^ stack[index].keys.full() ^ ZOBRIST.side;
+
+        for compared_ply in (3..=half_moves).step_by(2) {
+            index -= 1;
+            other ^= stack[index].keys.full() ^ stack[index - 1].keys.full() ^ ZOBRIST.side;
+            index -= 1;
+
+            if other != 0 {
+                continue;
+            }
+
+            let diff = current_key ^ stack[index].keys.full();
+            let mut cuckoo_index = h1(diff);
+
+            if cuckoo(cuckoo_index) != diff {
+                cuckoo_index = h2(diff);
+                if cuckoo(cuckoo_index) != diff {
+                    continue;
+                }
+            }
+
+            if (between(cuckoo_a(cuckoo_index), cuckoo_b(cuckoo_index)) & self.occupancies()).is_empty()
+                && (ply > compared_ply || stack[index].repetition != 0)
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    pub fn attackers_to(&self, square: Square, occupancies: Bitboard) -> Bitboard {
+        (rook_attacks(square, occupancies) & self.pieces2(PieceType::Rook, PieceType::Queen))
+            | (bishop_attacks(square, occupancies) & self.pieces2(PieceType::Bishop, PieceType::Queen))
+            | (pawn_attacks(square, Color::White) & self.colored_pieces(Color::Black, PieceType::Pawn))
+            | (pawn_attacks(square, Color::Black) & self.colored_pieces(Color::White, PieceType::Pawn))
+            | (knight_attacks(square) & self.pieces(PieceType::Knight))
+            | (king_attacks(square) & self.pieces(PieceType::King))
+    }
+
+    pub fn is_legal(&self, mv: Move) -> bool {
+        debug_assert!(mv.is_present());
+        let stm = self.side_to_move();
+        let king = self.king_square(stm);
+        let from = mv.from();
+        let to = mv.to();
+
+        if !self.colors(stm).contains(from) {
+            return false;
+        }
+
+        let piece = self.piece_on(from);
+
+        if piece.piece_type() == PieceType::King {
+            if mv.is_castling() {
+                let kind = CastlingKind::KINDS[stm][(to.file() == File::G) as usize];
+
+                return to == kind.landing_square()
+                    && self.castling().is_allowed(kind)
+                    && (self.castling_path[kind] & self.occupancies()).is_empty()
+                    && (self.castling_threat[kind] & self.all_threats()).is_empty()
+                    && !self.pinned(stm).contains(self.castling_rooks[kind]);
+            }
+
+            return !mv.is_special()
+                && !self.colors(stm).contains(to)
+                && (mv.is_capture() == self.colors(!stm).contains(to))
+                && (king_attacks(from) & !self.all_threats()).contains(to);
+        }
+
+        if self.colors(stm).contains(to)
+            || (self.pinned(stm).contains(from) && !ray_pass(king, from).contains(to))
+            || (self.in_check()
+                && (self.checkers().is_multiple()
+                    || (!mv.is_en_passant() && !(self.checkers() | between(king, self.checkers().lsb())).contains(to))))
+        {
+            return false;
+        }
+
+        if piece.piece_type() == PieceType::Pawn {
+            if mv.is_en_passant() {
+                let occupancies = self.occupancies() ^ from.to_bb() ^ to.to_bb() ^ (to ^ 8).to_bb();
+                let diagonal = self.colored_pieces2(!stm, PieceType::Bishop, PieceType::Queen);
+                let orthogonal = self.colored_pieces2(!stm, PieceType::Rook, PieceType::Queen);
+                let diagonal = bishop_attacks(king, occupancies) & diagonal;
+                let orthogonal = rook_attacks(king, occupancies) & orthogonal;
+                return to == self.en_passant()
+                    && pawn_attacks(from, stm).contains(to)
+                    && (orthogonal | diagonal).is_empty();
+            }
+
+            if mv.is_promotion() != (mv.to().rank() == PROMO_RANK[stm]) {
+                return false;
+            }
+
+            if mv.is_capture() {
+                return pawn_attacks(from, stm).contains(to) && self.colors(!stm).contains(to);
+            }
+
+            if mv.is_double_push() {
+                return from.rank() == PAWN_HOME_RANK[stm]
+                    && from.shift(2 * Square::UP[stm]) == to
+                    && !self.occupancies().contains(from.shift(Square::UP[stm]))
+                    && !self.occupancies().contains(to);
+            }
+
+            return !mv.is_castling() && from.shift(Square::UP[stm]) == to && !self.occupancies().contains(to);
+        }
+
+        !mv.is_special()
+            && (mv.is_capture() == self.colors(!stm).contains(to))
+            && attacks(piece, from, self.occupancies()).contains(to)
+    }
+
+    /// Quickly checks if the move *might* give check to the opponent's king.
+    ///
+    /// Roughly 90–95% accurate. Does not account for discovered checks, promotions,
+    /// en passant, or checks delivered via castling.
+    pub fn is_direct_check(&self, mv: Move) -> bool {
+        self.checking_squares(self.moved_piece(mv).piece_type()).contains(mv.to())
+    }
+
+    pub fn update_threats(&mut self) {
+        // The king is excluded from the occupancy bitboard when computing threats,
+        // letting sliders "see through" it as if the king weren't blocking their path.
+        //
+        // Although this changes the resulting threat bitboard, it has no impact on
+        // engine behavior, since such squares are not legal move targets, so threat
+        // history remains unaffected by this change.
+        //
+        // This "hack" is used to speed up the implementation of `Board::is_legal`.
+        let stm = self.side_to_move();
+        let occupancies = self.occupancies() ^ self.colored_pieces(stm, PieceType::King);
+
+        self.state.piece_threats[PieceType::Pawn] =
+            pawn_attacks_setwise(self.colored_pieces(!stm, PieceType::Pawn), !stm);
+        self.state.piece_threats[PieceType::Knight] =
+            knight_attacks_setwise(self.colored_pieces(!stm, PieceType::Knight));
+        self.state.piece_threats[PieceType::Bishop] =
+            bishop_attacks_setwise(self.colored_pieces(!stm, PieceType::Bishop), occupancies);
+        self.state.piece_threats[PieceType::Rook] =
+            rook_attacks_setwise(self.colored_pieces(!stm, PieceType::Rook), occupancies);
+        self.state.piece_threats[PieceType::Queen] =
+            bishop_attacks_setwise(self.colored_pieces(!stm, PieceType::Queen), occupancies)
+                | rook_attacks_setwise(self.colored_pieces(!stm, PieceType::Queen), occupancies);
+        self.state.piece_threats[PieceType::King] = king_attacks(self.king_square(!stm));
+
+        self.state.all_threats = self.piece_threats(PieceType::Pawn)
+            | self.piece_threats(PieceType::Knight)
+            | self.piece_threats(PieceType::Bishop)
+            | self.piece_threats(PieceType::Rook)
+            | self.piece_threats(PieceType::Queen)
+            | self.piece_threats(PieceType::King);
+
+        let diagonal = self.pieces2(PieceType::Bishop, PieceType::Queen);
+        let orthogonal = self.pieces2(PieceType::Rook, PieceType::Queen);
+
+        self.state.pinned = [Bitboard::default(); 2];
+        self.state.pinners = [Bitboard::default(); 2];
+
+        for color in [Color::White, Color::Black] {
+            let king = self.king_square(color);
+
+            if color == stm {
+                self.state.checkers = (pawn_attacks(king, stm) & self.colored_pieces(!stm, PieceType::Pawn))
+                    | (knight_attacks(king) & self.colored_pieces(!stm, PieceType::Knight));
+            } else {
+                self.state.checking_squares[PieceType::Pawn] = pawn_attacks(king, !stm);
+                self.state.checking_squares[PieceType::Knight] = knight_attacks(king);
+                self.state.checking_squares[PieceType::Bishop] = bishop_attacks(king, self.occupancies());
+                self.state.checking_squares[PieceType::Rook] = rook_attacks(king, self.occupancies());
+                self.state.checking_squares[PieceType::Queen] =
+                    self.checking_squares(PieceType::Bishop) | self.checking_squares(PieceType::Rook);
+            }
+
+            let diagonal = diagonal & bishop_attacks(king, self.colors(!color)) & self.colors(!color);
+            let orthogonal = orthogonal & rook_attacks(king, self.colors(!color)) & self.colors(!color);
+
+            for square in diagonal | orthogonal {
+                let blockers = between(king, square) & self.colors(color);
+                match blockers.popcount() {
+                    0 => {
+                        debug_assert_eq!(color, stm);
+                        self.state.checkers.set(square);
+                    }
+                    1 => {
+                        self.state.pinners[!color].set(square);
+                        self.state.pinned[color] |= blockers;
+                    }
+                    _ => (),
+                }
+            }
+        }
+    }
+
+    pub fn update_hash_keys(&mut self) {
+        self.state.keys = Keys::default();
+
+        for piece in 0..Piece::NUM {
+            let piece = Piece::from_index(piece);
+
+            for square in self.colored_pieces(piece.color(), piece.piece_type()) {
+                self.update_hash(piece, square);
+            }
+        }
+
+        if self.en_passant() != Square::None {
+            self.state.keys.toggle_en_passant(self.en_passant());
+        }
+
+        if self.side_to_move() == Color::White {
+            self.state.keys.toggle_side();
+        }
+
+        self.state.keys.toggle_castling(self.state.castling);
+    }
+
+    /// We verify is self.state.enpassant is valid, and remove it if it is not.
+    /// This must be called after pinners and checkers have been updated.
+    fn validate_en_passant(&mut self) {
+        debug_assert!(!self.all_threats().is_empty());
+
+        let ep = self.en_passant();
+        if ep == Square::None {
+            return;
+        }
+
+        let stm = self.side_to_move();
+        let king = self.king_square(stm);
+        let ep_occ = self.occupancies() ^ ep.to_bb() ^ (ep ^ 8).to_bb();
+        let ep_takers = pawn_attacks(ep, !stm) & self.colored_pieces(stm, PieceType::Pawn);
+
+        for ep_taker in ep_takers {
+            let occ = ep_occ ^ ep_taker.to_bb();
+            let checkers = (rook_attacks(king, occ) & self.pieces2(PieceType::Rook, PieceType::Queen))
+                | (bishop_attacks(king, occ) & self.pieces2(PieceType::Bishop, PieceType::Queen));
+
+            if (checkers & self.colors(!stm)).is_empty() {
+                // En passant capture is allowed
+                return;
+            }
+        }
+
+        self.state.keys.toggle_en_passant(ep);
+        self.state.en_passant = Square::None;
+    }
+
+    pub fn get_castling_rook(&self, king_to: Square) -> (Square, Square) {
+        match king_to {
+            Square::G1 => (self.castling_rooks[CastlingKind::WhiteKingside], Square::F1),
+            Square::C1 => (self.castling_rooks[CastlingKind::WhiteQueenside], Square::D1),
+            Square::G8 => (self.castling_rooks[CastlingKind::BlackKingside], Square::F8),
+            Square::C8 => (self.castling_rooks[CastlingKind::BlackQueenside], Square::D8),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(target_feature = "avx2")]
+    pub unsafe fn mailbox_vector_avx2(&self) -> [std::arch::x86_64::__m256i; 2] {
+        use std::arch::x86_64::*;
+        let ptr: *const __m256i = self.mailbox.as_ptr().cast();
+        [_mm256_loadu_si256(ptr), _mm256_loadu_si256(ptr.add(1))]
+    }
+
+    #[cfg(target_feature = "avx512f")]
+    pub unsafe fn mailbox_vector_avx512(&self) -> std::arch::x86_64::__m512i {
+        std::arch::x86_64::_mm512_loadu_si512(self.mailbox.as_ptr().cast())
+    }
+}
+
+impl Default for Board {
+    fn default() -> Self {
+        Self {
+            state: InternalState::default(),
+            pieces: [Bitboard::default(); PieceType::NUM],
+            colors: [Bitboard::default(); Color::NUM],
+            mailbox: [Piece::None; Square::NUM],
+            state_stack: Vec::with_capacity(2048),
+            halfmove_number: 0,
+            castling_rights: [0b1111; Square::NUM],
+            castling_path: [Bitboard::default(); 16],
+            castling_threat: [Bitboard::default(); 16],
+            castling_rooks: [Square::None; 16],
+            frc: false,
+        }
+    }
+}
+
+pub trait BoardObserver {
+    fn on_piece_change(&mut self, board: &Board, piece: Piece, sq: Square, add: bool);
+    fn on_piece_move(&mut self, board: &Board, piece: Piece, from: Square, to: Square);
+    fn on_piece_mutate(&mut self, board: &Board, old_piece: Piece, new_piece: Piece, sq: Square);
+}
+
+pub struct NullBoardObserver;
+
+impl BoardObserver for NullBoardObserver {
+    fn on_piece_change(&mut self, _: &Board, _: Piece, _: Square, _: bool) {}
+    fn on_piece_move(&mut self, _: &Board, _: Piece, _: Square, _: Square) {}
+    fn on_piece_mutate(&mut self, _: &Board, _: Piece, _: Piece, _: Square) {}
+}
