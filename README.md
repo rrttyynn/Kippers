@@ -48,11 +48,7 @@ The Makefile and the supplied Cargo configuration target the build machine's
 CPU by default. Set `RUSTFLAGS` explicitly when building for another CPU;
 the resulting executable must only use instructions supported by its target.
 
-The original network, `networks/v60-7f587dfb.nnue`, is included and embedded
-in the executable during compilation. `EVALFILE` can specify another network
-file compatible with this engine. If the bundled network is missing and
-`EVALFILE` is unset, the build script attempts to download the original network
-from the RecklessNetworks repository using `curl`.
+The original network weights are not included in this repository. During compilation, the build script downloads `v60-7f587dfb.nnue` from the upstream RecklessNetworks repository using `curl` if the file is missing and `EVALFILE` is unset. Alternatively, set `EVALFILE` to the path of a compatible local network file. The selected network is embedded in the executable during compilation.
 
 The Makefile also provides a `make pgo` target, which requires `cargo-pgo`
 and its LLVM profiling tools. Performance gains depend on the target machine
