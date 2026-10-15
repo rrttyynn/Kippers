@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::{
     board::{Board, NullBoardObserver},
     search::Report,
     thread::{SharedContext, Status, ThreadData},
     threadpool::ThreadPool,
-    time::{Limits, TimeManager},
+    time::{Limits, SearchControl, TimeManager},
     tools,
     transposition::DEFAULT_TT_SIZE,
     types::{Color, Move, Piece, Score, Square, is_decisive, is_loss, is_win},
@@ -21,6 +21,7 @@ enum Mode {
 
 struct Settings {
     frc: bool,
+    ponder: bool,
     move_overhead: u64,
     report: Report,
 }
@@ -29,11 +30,22 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             frc: false,
+            ponder: false,
             move_overhead: 50,
             report: Report::Full,
         }
     }
 }
+
+// The listener owns input, while message_loop owns the board and worker pool.
+// Acknowledgements preserve input order without blocking stop/ponderhit during
+// search. Native ponder support added in Kippers, October 15, 2026.
+struct Command {
+    text: String,
+    accepted: Option<mpsc::SyncSender<()>>,
+}
+
+type ActiveSearch = Arc<Mutex<Option<Arc<SearchControl>>>>;
 
 pub fn message_loop(mut buffer: VecDeque<String>) {
     let shared = Arc::new(SharedContext::default());
@@ -41,13 +53,14 @@ pub fn message_loop(mut buffer: VecDeque<String>) {
     let mut threads = ThreadPool::new(shared.clone());
     let mut board = Board::starting_position();
 
-    let rx = spawn_listener(shared.clone());
+    let active_search: ActiveSearch = Arc::new(Mutex::new(None));
+    let rx = spawn_listener(shared.clone(), active_search.clone());
 
     let mut mode = if buffer.is_empty() { Mode::Uci } else { Mode::Cli };
 
     loop {
-        let message = if let Some(cmd) = buffer.pop_front() {
-            cmd
+        let Command { text: message, mut accepted } = if let Some(cmd) = buffer.pop_front() {
+            Command { text: cmd, accepted: None }
         } else if mode == Mode::Uci {
             match rx.recv() {
                 Ok(cmd) => cmd,
@@ -66,12 +79,15 @@ pub fn message_loop(mut buffer: VecDeque<String>) {
 
             ["isready"] => println!("readyok"),
 
-            ["go", tokens @ ..] => go(&mut threads, &settings, &board, &shared, tokens),
+            ["go", tokens @ ..] => {
+                go(&mut threads, &settings, &board, &shared, &active_search, tokens, accepted.take());
+            }
             ["position", tokens @ ..] => position(&mut board, &settings, tokens),
             ["setoption", tokens @ ..] => set_option(&mut threads, &mut settings, &shared, tokens),
             ["ucinewgame"] => reset(&mut threads, &shared),
 
             ["stop"] => shared.status.set(Status::STOPPED),
+            ["ponderhit"] => (), // Idle/CLI ponderhit has no effect.
             ["quit"] => {
                 drop(threads);
                 break;
@@ -97,6 +113,10 @@ pub fn message_loop(mut buffer: VecDeque<String>) {
             _ => eprintln!("Unknown command: '{}'", message.trim_end()),
         }
 
+        if let Some(ack) = accepted {
+            let _ = ack.send(());
+        }
+
         // Auto-exit after last CLI command
         if matches!(mode, Mode::Cli) && buffer.is_empty() {
             drop(threads);
@@ -105,34 +125,44 @@ pub fn message_loop(mut buffer: VecDeque<String>) {
     }
 }
 
-fn spawn_listener(shared: Arc<SharedContext>) -> std::sync::mpsc::Receiver<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
+fn spawn_listener(shared: Arc<SharedContext>, active_search: ActiveSearch) -> mpsc::Receiver<Command> {
+    let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
         loop {
             let mut message = String::new();
 
-            if std::io::stdin().read_line(&mut message).unwrap() == 0 {
-                // EOF received
-                shared.status.set(Status::STOPPED);
-                let _ = tx.send("quit".to_string());
+            if !matches!(std::io::stdin().read_line(&mut message), Ok(n) if n > 0) {
+                stop_search(&shared, &active_search);
+                let _ = tx.send(Command { text: "quit".to_string(), accepted: None });
                 break;
             }
 
-            match message.trim_end() {
+            match message.trim() {
                 "isready" => println!("readyok"),
-                "stop" => shared.status.set(Status::STOPPED),
+                "stop" => stop_search(&shared, &active_search),
+                "ponderhit" => {
+                    if let Some(control) = active_search.lock().unwrap().as_ref() {
+                        control.ponderhit();
+                    }
+                }
                 "quit" => {
-                    shared.status.set(Status::STOPPED);
-                    let _ = tx.send("quit".to_string());
+                    stop_search(&shared, &active_search);
+                    let _ = tx.send(Command { text: "quit".to_string(), accepted: None });
                     break;
                 }
                 _ => {
                     // According to the UCI specs, commands that are unexpected
                     // in the current state should be ignored silently.
                     // (https://backscattering.de/chess/uci/#unexpected)
-                    if shared.status.get() != Status::RUNNING {
-                        let _ = tx.send(message);
+                    let busy = active_search.lock().unwrap().as_ref().is_some_and(|control| !control.is_stopped());
+                    if !busy {
+                        let (ack, received) = mpsc::sync_channel(0);
+                        if tx.send(Command { text: message, accepted: Some(ack) }).is_err()
+                            || received.recv().is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -142,6 +172,14 @@ fn spawn_listener(shared: Arc<SharedContext>) -> std::sync::mpsc::Receiver<Strin
     rx
 }
 
+fn stop_search(shared: &SharedContext, active_search: &ActiveSearch) {
+    let active = active_search.lock().unwrap();
+    shared.status.set(Status::STOPPED);
+    if let Some(control) = active.as_ref() {
+        control.stop();
+    }
+}
+
 fn uci() {
     println!("id name Kippers {}", env!("ENGINE_VERSION"));
     println!("id author Quedanomo");
@@ -149,6 +187,7 @@ fn uci() {
     println!("option name Threads type spin default 1 min 1 max {}", ThreadPool::available_threads());
     println!("option name MoveOverhead type spin default 50 min 0 max 2000");
     println!("option name Minimal type check default false");
+    println!("option name Ponder type check default false");
     println!("option name Clear Hash type button");
     println!("option name UCI_Chess960 type check default false");
 
@@ -162,13 +201,33 @@ fn reset(threads: &mut ThreadPool, shared: &Arc<SharedContext>) {
     shared.history.clear();
 }
 
-fn go(threads: &mut ThreadPool, settings: &Settings, board: &Board, shared: &Arc<SharedContext>, tokens: &[&str]) {
+fn go(
+    threads: &mut ThreadPool, settings: &Settings, board: &Board, shared: &Arc<SharedContext>,
+    active_search: &ActiveSearch, tokens: &[&str], accepted: Option<mpsc::SyncSender<()>>,
+) {
     let limits = parse_limits(board.side_to_move(), tokens);
-    let time_manager = TimeManager::new(limits, board.fullmove_number(), settings.move_overhead);
+    // go ponder is authoritative; the option advertises whether the GUI plans
+    // to use pondering and enables the optional predicted-reply output.
+    let pondering = tokens.contains(&"ponder");
+    let control = Arc::new(SearchControl::new(pondering));
+    let mut time_manager = TimeManager::new(limits, board.fullmove_number(), settings.move_overhead);
+    if pondering {
+        time_manager = time_manager.with_ponder(control.clone());
+    }
+    *active_search.lock().unwrap() = Some(control.clone());
 
-    threads.execute_searches(time_manager, settings.report, board, shared);
+    threads.execute_searches_with_start(time_manager, settings.report, board, shared, || {
+        if let Some(ack) = accepted {
+            let _ = ack.send(());
+        }
+    });
+
+    // A depth/node/mate limit or a terminal position may finish the calculation
+    // before the opponent moves. Never send bestmove while still pondering.
+    control.wait_for_release();
 
     if threads[0].root_moves.is_empty() {
+        *active_search.lock().unwrap() = None;
         println!("bestmove (none)");
         return;
     }
@@ -223,7 +282,20 @@ fn go(threads: &mut ThreadPool, settings: &Settings, board: &Board, shared: &Arc
         threads[best].print_uci_info(depth);
     }
 
-    println!("bestmove {}", threads[best].root_moves[0].mv.to_uci(board));
+    let root = &threads[best].root_moves[0];
+    let mut result = format!("bestmove {}", root.mv.to_uci(board));
+    if settings.ponder
+        && let Some(&reply) = root.pv.line().first()
+    {
+        let mut next = board.clone();
+        next.make_move(root.mv, &mut NullBoardObserver);
+        if next.generate_all_moves().iter().any(|entry| entry.mv == reply) {
+            result.push_str(&format!(" ponder {}", reply.to_uci(&next)));
+        }
+    }
+
+    *active_search.lock().unwrap() = None;
+    println!("{result}");
 }
 
 fn position(board: &mut Board, settings: &Settings, mut tokens: &[&str]) {
@@ -261,6 +333,11 @@ fn make_uci_move(board: &mut Board, uci_move: &str) {
 
 fn set_option(threads: &mut ThreadPool, settings: &mut Settings, shared: &Arc<SharedContext>, tokens: &[&str]) {
     match tokens {
+        ["name", "Ponder", "value", v] => match *v {
+            "true" => settings.ponder = true,
+            "false" => settings.ponder = false,
+            _ => eprintln!("Invalid value: '{v}'"),
+        },
         ["name", "Minimal", "value", v] => match *v {
             "true" => settings.report = Report::Minimal,
             "false" => settings.report = Report::Full,
@@ -350,7 +427,7 @@ fn eval(td: &mut ThreadData, board: &Board) {
 }
 
 fn parse_limits(color: Color, tokens: &[&str]) -> Limits {
-    if let ["infinite"] = tokens {
+    if tokens.contains(&"infinite") {
         return Limits::Infinite;
     }
 
@@ -358,11 +435,10 @@ fn parse_limits(color: Color, tokens: &[&str]) -> Limits {
     let mut inc = None;
     let mut moves = None;
 
-    for chunk in tokens.chunks(2) {
-        if let [name, value] = *chunk {
-            let Ok(value) = value.parse::<u64>() else {
-                continue;
-            };
+    // Flags such as ponder do not have a value and must not shift the pairing
+    // of subsequent clock arguments. Also accept flags after limit arguments.
+    for (index, &name) in tokens.iter().enumerate() {
+        if let Some(value) = tokens.get(index + 1).and_then(|value| value.parse::<u64>().ok()) {
 
             match name {
                 "depth" if value > 0 => return Limits::Depth(value as i32),
@@ -397,6 +473,27 @@ fn parse_limits(color: Color, tokens: &[&str]) -> Limits {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ponder_flag_does_not_displace_clock_arguments() {
+        for tokens in [
+            vec!["ponder", "wtime", "120000", "btime", "60000", "winc", "1000", "binc", "2000"],
+            vec!["wtime", "120000", "ponder", "btime", "60000", "winc", "1000", "binc", "2000"],
+            vec!["wtime", "120000", "btime", "60000", "winc", "1000", "binc", "2000", "ponder"],
+        ] {
+            assert_eq!(parse_limits(Color::White, &tokens), Limits::Fischer(120000, 1000));
+            assert_eq!(parse_limits(Color::Black, &tokens), Limits::Fischer(60000, 2000));
+        }
+        assert_eq!(parse_limits(Color::White, &["ponder", "movetime", "250"]), Limits::Time(250));
+        assert_eq!(parse_limits(Color::White, &["ponder", "depth", "4"]), Limits::Depth(4));
+        assert_eq!(parse_limits(Color::White, &["nodes", "100", "ponder"]), Limits::Nodes(100));
+        assert_eq!(parse_limits(Color::White, &["ponder", "mate", "1"]), Limits::Mate(1));
+        assert_eq!(parse_limits(Color::White, &["ponder", "infinite"]), Limits::Infinite);
+        assert_eq!(
+            parse_limits(Color::White, &["ponder", "wtime", "5000", "winc", "20", "movestogo", "10"]),
+            Limits::Cyclic(5000, 20, 10),
+        );
+    }
 
     fn test_position_helper(tokens: &[&str]) -> Board {
         let settings = Settings::default();

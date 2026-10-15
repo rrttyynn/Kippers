@@ -75,12 +75,22 @@ impl ThreadPool {
         &mut self, time_manager: TimeManager, report: Report, board: &Board,
         shared: &Arc<SharedContext>,
     ) {
+        self.execute_searches_with_start(time_manager, report, board, shared, || {});
+    }
+
+    // Acknowledge UCI go only after initialization, so an immediate stop or
+    // ponderhit cannot be overwritten by search startup. Kippers, October 15, 2026.
+    pub fn execute_searches_with_start(
+        &mut self, time_manager: TimeManager, report: Report, board: &Board,
+        shared: &Arc<SharedContext>, on_start: impl FnOnce(),
+    ) {
         shared.tt.increment_age();
 
         shared.nodes.reset();
         shared.soft_stop_votes.store(0, Ordering::Release);
         shared.status.set(Status::RUNNING);
         shared.best_stats.store((self.main_thread().previous_best_score + 32768) as u32, Ordering::Release);
+        on_start();
 
         std::thread::scope(|scope| {
             let mut handlers = Vec::new();
