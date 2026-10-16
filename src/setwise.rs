@@ -1,0 +1,137 @@
+#[cfg(target_feature = "avx2")]
+use crate::types::Rank;
+use crate::types::{Bitboard, Color, File};
+
+const A: Bitboard = Bitboard::file(File::A);
+const B: Bitboard = Bitboard::file(File::B);
+const G: Bitboard = Bitboard::file(File::G);
+const H: Bitboard = Bitboard::file(File::H);
+#[cfg(target_feature = "avx2")]
+const R1: Bitboard = Bitboard::rank(Rank::R1);
+#[cfg(target_feature = "avx2")]
+const R8: Bitboard = Bitboard::rank(Rank::R8);
+
+pub fn pawn_attacks_setwise(bb: Bitboard, color: Color) -> Bitboard {
+    let (up_right, up_left) = match color {
+        Color::White => (9, 7),
+        Color::Black => (-7, -9),
+    };
+
+    (bb & !H).shift(up_right) | (bb & !A).shift(up_left)
+}
+
+#[inline]
+pub fn knight_attacks_setwise(bb: Bitboard) -> Bitboard {
+    let not_a = bb & !A;
+    let not_ab = bb & !(A | B);
+    let not_h = bb & !H;
+    let not_gh = bb & !(G | H);
+
+    not_a.shift(15)
+        | not_a.shift(-17)
+        | not_ab.shift(6)
+        | not_ab.shift(-10)
+        | not_h.shift(17)
+        | not_h.shift(-15)
+        | not_gh.shift(10)
+        | not_gh.shift(-6)
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline]
+pub fn bishop_attacks_setwise(bb: Bitboard, occupancies: Bitboard) -> Bitboard {
+    use crate::lookup::bishop_attacks;
+
+    let mut result = Bitboard(0);
+    for square in bb {
+        result |= bishop_attacks(square, occupancies);
+    }
+    result
+}
+
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub fn bishop_attacks_setwise(bb: Bitboard, occupancies: Bitboard) -> Bitboard {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mask = _mm256_set_epi64x(!(R8 | H).0 as i64, !(R8 | A).0 as i64, !(R1 | H).0 as i64, !(R1 | A).0 as i64);
+
+        let generate = _mm256_set1_epi64x(bb.0 as i64);
+        let propagate = _mm256_and_si256(_mm256_set1_epi64x(!occupancies.0 as i64), mask);
+        let generate = _mm256_or_si256(generate, _mm256_and_si256(propagate, shiftv::<-9, -7, 7, 9>(generate)));
+        let propagate = _mm256_and_si256(propagate, shiftv::<-9, -7, 7, 9>(propagate));
+        let generate = _mm256_or_si256(generate, _mm256_and_si256(propagate, shiftv::<-18, -14, 14, 18>(generate)));
+        let propagate = _mm256_and_si256(propagate, shiftv::<-18, -14, 14, 18>(propagate));
+        let generate = _mm256_or_si256(generate, _mm256_and_si256(propagate, shiftv::<-36, -28, 28, 36>(generate)));
+        let attacks = _mm256_and_si256(shiftv::<-9, -7, 7, 9>(generate), mask);
+
+        fold_to_bitboard(attacks)
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline]
+pub fn rook_attacks_setwise(bb: Bitboard, occupancies: Bitboard) -> Bitboard {
+    use crate::lookup::rook_attacks;
+
+    let mut result = Bitboard(0);
+    for square in bb {
+        result |= rook_attacks(square, occupancies);
+    }
+    result
+}
+
+#[cfg(target_feature = "avx2")]
+#[inline]
+pub fn rook_attacks_setwise(bb: Bitboard, occupancies: Bitboard) -> Bitboard {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        let mask = _mm256_set_epi64x(!R8.0 as i64, !H.0 as i64, !A.0 as i64, !R1.0 as i64);
+
+        let generate = _mm256_set1_epi64x(bb.0 as i64);
+        let propagate = _mm256_and_si256(_mm256_set1_epi64x(!occupancies.0 as i64), mask);
+        let generate = _mm256_or_si256(generate, _mm256_and_si256(propagate, shiftv::<-8, -1, 1, 8>(generate)));
+        let propagate = _mm256_and_si256(propagate, shiftv::<-8, -1, 1, 8>(propagate));
+        let generate = _mm256_or_si256(generate, _mm256_and_si256(propagate, shiftv::<-16, -2, 2, 16>(generate)));
+        let propagate = _mm256_and_si256(propagate, shiftv::<-16, -2, 2, 16>(propagate));
+        let generate = _mm256_or_si256(generate, _mm256_and_si256(propagate, shiftv::<-32, -4, 4, 32>(generate)));
+        let attacks = _mm256_and_si256(shiftv::<-8, -1, 1, 8>(generate), mask);
+
+        fold_to_bitboard(attacks)
+    }
+}
+
+#[cfg(all(target_feature = "avx2", not(target_feature = "avx512f")))]
+#[inline]
+unsafe fn shiftv<const A: i64, const B: i64, const C: i64, const D: i64>(
+    vector: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+
+    _mm256_or_si256(
+        _mm256_sllv_epi64(vector, _mm256_set_epi64x(A, B, C, D)),
+        _mm256_srlv_epi64(vector, _mm256_set_epi64x(-A, -B, -C, -D)),
+    )
+}
+
+#[cfg(target_feature = "avx512f")]
+#[inline]
+unsafe fn shiftv<const A: i64, const B: i64, const C: i64, const D: i64>(
+    vector: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+
+    _mm256_rolv_epi64(vector, _mm256_set_epi64x(A, B, C, D))
+}
+
+#[cfg(target_feature = "avx2")]
+#[inline]
+unsafe fn fold_to_bitboard(vector: core::arch::x86_64::__m256i) -> Bitboard {
+    use core::arch::x86_64::*;
+
+    let vector = _mm_or_si128(_mm256_castsi256_si128(vector), _mm256_extracti128_si256::<1>(vector));
+    let result = _mm_extract_epi64::<0>(vector) | _mm_extract_epi64::<1>(vector);
+    Bitboard(result as u64)
+}

@@ -1,0 +1,82 @@
+use std::ops::{Index, IndexMut};
+
+use crate::types::{MAX_PLY, Move, Piece, Score};
+
+pub struct Stack {
+    data: [StackEntry; MAX_PLY + 16],
+    sentinel: [[i16; 64]; 13],
+}
+
+impl Stack {
+    pub fn sentinel(&mut self) -> &mut StackEntry {
+        unsafe { self.data.get_unchecked_mut(0) }
+    }
+
+    pub fn new() -> Box<Self> {
+        let mut stack = Box::new(Self::default());
+        let ptr = &raw mut stack.sentinel;
+        for entry in &mut stack.data {
+            entry.conthist = ptr;
+            entry.contcorrhist = ptr;
+        }
+        stack
+    }
+}
+
+impl Default for Stack {
+    fn default() -> Self {
+        Self {
+            data: [StackEntry::default(); MAX_PLY + 16],
+            sentinel: [[0; 64]; 13],
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct StackEntry {
+    pub mv: Move,
+    pub piece: Piece,
+    pub eval: i32,
+    pub tt_move: Move,
+    pub tt_pv: bool,
+    pub move_count: u16,
+    pub reduction: i32,
+    pub laterality: i32,
+    pub conthist: *mut [[i16; 64]; 13],
+    pub contcorrhist: *mut [[i16; 64]; 13],
+}
+
+unsafe impl Send for StackEntry {}
+
+impl Default for StackEntry {
+    fn default() -> Self {
+        Self {
+            mv: Move::NULL,
+            piece: Piece::None,
+            eval: Score::NONE,
+            tt_move: Move::NULL,
+            tt_pv: false,
+            move_count: 0,
+            reduction: 0,
+            laterality: 0,
+            conthist: std::ptr::null_mut(),
+            contcorrhist: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl Index<isize> for Stack {
+    type Output = StackEntry;
+
+    fn index(&self, index: isize) -> &Self::Output {
+        debug_assert!(index + 8 >= 0 && index < MAX_PLY as isize + 16);
+        &self.data[(index + 8) as usize]
+    }
+}
+
+impl IndexMut<isize> for Stack {
+    fn index_mut(&mut self, index: isize) -> &mut Self::Output {
+        debug_assert!(index + 8 >= 0 && index < MAX_PLY as isize + 16);
+        &mut self.data[(index + 8) as usize]
+    }
+}

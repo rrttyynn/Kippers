@@ -1,0 +1,131 @@
+use crate::types::{Bitboard, Color, Piece, PieceType, Square, ZOBRIST};
+
+include!(concat!(env!("OUT_DIR"), "/lookup.rs"));
+
+static mut CUCKOO: [u64; 0x2000] = [0; 0x2000];
+static mut A: [Square; 0x2000] = [Square::None; 0x2000];
+static mut B: [Square; 0x2000] = [Square::None; 0x2000];
+
+pub fn initialize() {
+    unsafe {
+        init_cuckoo();
+    }
+}
+
+unsafe fn init_cuckoo() {
+    for index in 2..12 {
+        let piece = Piece::from_index(index);
+
+        debug_assert!(piece.piece_type() != PieceType::Pawn);
+
+        for a in 0..64 {
+            for b in (a + 1)..64 {
+                let mut a = Square::new(a);
+                let mut b = Square::new(b);
+
+                if !attacks(piece, a, Bitboard(0)).contains(b) {
+                    continue;
+                }
+
+                let mut mv = ZOBRIST.pieces[piece][a] ^ ZOBRIST.pieces[piece][b] ^ ZOBRIST.side;
+                let mut i = h1(mv);
+
+                loop {
+                    std::mem::swap(&mut CUCKOO[i], &mut mv);
+                    std::mem::swap(&mut A[i], &mut a);
+                    std::mem::swap(&mut B[i], &mut b);
+
+                    if a == Square::None && b == Square::None {
+                        break;
+                    }
+
+                    i = if i == h1(mv) { h2(mv) } else { h1(mv) };
+                }
+            }
+        }
+    }
+}
+
+pub const fn h1(h: u64) -> usize {
+    ((h >> 32) & 0x1fff) as usize
+}
+
+pub const fn h2(h: u64) -> usize {
+    ((h >> 48) & 0x1fff) as usize
+}
+
+pub fn cuckoo(index: usize) -> u64 {
+    unsafe { CUCKOO[index] }
+}
+
+pub fn cuckoo_a(index: usize) -> Square {
+    unsafe { A[index] }
+}
+
+pub fn cuckoo_b(index: usize) -> Square {
+    unsafe { B[index] }
+}
+
+pub fn relative_diagonal(color: Color, sq: Square) -> Bitboard {
+    unsafe { Bitboard(*DIAGONALS[color as usize].get_unchecked(sq as usize)) }
+}
+
+pub fn attacks(piece: Piece, square: Square, occupancies: Bitboard) -> Bitboard {
+    match piece.piece_type() {
+        PieceType::Pawn => pawn_attacks(square, piece.color()),
+        PieceType::Knight => knight_attacks(square),
+        PieceType::Bishop => bishop_attacks(square, occupancies),
+        PieceType::Rook => rook_attacks(square, occupancies),
+        PieceType::Queen => queen_attacks(square, occupancies),
+        PieceType::King => king_attacks(square),
+        PieceType::None => Bitboard(0),
+    }
+}
+
+pub fn pawn_attacks(square: Square, color: Color) -> Bitboard {
+    unsafe { Bitboard(*PAWN_MAP.get_unchecked(color as usize).get_unchecked(square as usize)) }
+}
+
+pub fn king_attacks(square: Square) -> Bitboard {
+    unsafe { Bitboard(*KING_MAP.get_unchecked(square as usize)) }
+}
+
+pub fn knight_attacks(square: Square) -> Bitboard {
+    unsafe { Bitboard(*KNIGHT_MAP.get_unchecked(square as usize)) }
+}
+
+pub fn rook_attacks(square: Square, occupancies: Bitboard) -> Bitboard {
+    unsafe {
+        let entry = ROOK_MAGICS.get_unchecked(square as usize);
+        let index = magic_index(occupancies, entry);
+
+        Bitboard(*ROOK_MAP.get_unchecked(index as usize))
+    }
+}
+
+pub fn ray_pass(square1: Square, square2: Square) -> Bitboard {
+    unsafe { Bitboard(*RAYPASS[square1 as usize].get_unchecked(square2 as usize)) }
+}
+
+pub fn between(square1: Square, square2: Square) -> Bitboard {
+    unsafe { Bitboard(*BETWEEN[square1 as usize].get_unchecked(square2 as usize)) }
+}
+
+pub fn bishop_attacks(square: Square, occupancies: Bitboard) -> Bitboard {
+    unsafe {
+        let entry = BISHOP_MAGICS.get_unchecked(square as usize);
+        let index = magic_index(occupancies, entry);
+
+        Bitboard(*BISHOP_MAP.get_unchecked(index as usize))
+    }
+}
+
+pub fn queen_attacks(square: Square, occupancies: Bitboard) -> Bitboard {
+    rook_attacks(square, occupancies) | bishop_attacks(square, occupancies)
+}
+
+const fn magic_index(occupancies: Bitboard, entry: &MagicEntry) -> u32 {
+    let mut hash = occupancies.0 & entry.mask;
+    hash = hash.wrapping_mul(entry.magic) >> entry.shift;
+    hash as u32 + entry.offset
+}
