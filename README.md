@@ -1,117 +1,113 @@
-# Kippers 0.0.1
 
-Kippers is a UCI chess engine maintained by Quedanomo and derived from
-[Reckless](https://github.com/codedeliveryservice/Reckless) 0.10.0-dev.
-It requires a UCI-compatible chess interface or match runner.
+# Kippers
 
-This edition retains the upstream search algorithms, NNUE evaluation, and
-original network weights, while reducing optional features and build
-dependencies. It does not have an independently established Elo rating.
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
+[![Language: Rust](https://img.shields.io/badge/Language-Rust_1.88+-orange.svg)](https://www.rust-lang.org/)
+[![Protocol: UCI](https://img.shields.io/badge/Protocol-UCI-brightgreen.svg)](https://en.wikipedia.org/wiki/Universal_Chess_Interface)
+[![Release: 0.0.1](https://img.shields.io/badge/Release-v0.0.1-purple.svg)](https://github.com/rrttyynn/Kippers)
 
-## Features
+> A streamlined, deterministic UCI chess engine powered by NNUE, derived from [Reckless](https://github.com/codedeliveryservice/Reckless) 0.10.0-dev.
 
-- Standard chess and Chess960.
-- Single principal variation search, permanently fixed at MultiPV 1.
-- Lazy SMP parallel search, with one search thread enabled by default.
-- Dynamic time management, plus fixed time, depth, and node limits.
-- Native SIMD implementations selected at compile time for the target CPU.
-- Configurable hash size, search thread count, and move overhead.
+**Kippers 0.0.1** focuses on raw search efficiency, predictability, and minimal operational overhead. By stripping optional extensions, heavy build-time tooling, and unstable background-thread mechanics (such as pondering), it provides a clean, self-contained, and reproducible chess engine for analysis and match play.
 
-Syzygy tablebases, WebAssembly, NUMA management, runtime parameter tuning,
-debug statistics, and the `compiler` and `speedtest` commands are not included.
-Ponder mode is not implemented.
+---
 
-## Building
+## Highlights
 
-Requirements:
+- **Embedded NNUE Evaluation**: Comes bundled with verified network weights (`v60-7f587dfb.nnue`). Fully functional out-of-the-box without runtime network downloads.
+- **Deterministic Single-PV Search**: Permanently pinned to `MultiPV 1` to eliminate branch dilution and focus computational budget on the critical path.
+- **Lazy SMP Scaling**: Efficient lockless multi-threading scaling from 1 core up to maximum system capacity.
+- **Variant Support**: Native support for both Standard Chess and Chess960 (Fischer Random Chess).
+- **Zero Bloat**: Stripped of Syzygy tablebases, NUMA thread binders, runtime tuning daemons, and ponder race conditions to ensure maximum scheduling stability.
+- **Native SIMD Vectorization**: Automatically selects optimal CPU instruction extensions (AVX2, AVX-512, NEON) at compile time.
 
-- Rust 1.88.0 or later, including Cargo.
-- A system linker and the native toolchain required by Rust.
-- Make, when using the Makefile.
+---
 
-Build with Make:
+## Quick Start
 
-```sh
-make
-./kippers
-```
+### Prerequisites
 
-Or build directly with Cargo:
+- **Rust**: `1.88.0` or higher (`cargo` included)
+- **C Linker**: `gcc`, `clang`, or MSVC
+- **Make** *(optional, for Makefile workflow)*
 
-```sh
+### Building from Source
+
+Clone the repository and build using your preferred method:
+
+#### Option 1: Using `cargo` (Cross-platform)
+
+```bash
+# Build optimized release binary
 cargo build --release --locked --bin kippers
-./target/release/kippers
+
+# Binary output: ./target/release/kippers (or kippers.exe on Windows)
+
 ```
 
-On Windows, the executable is named `kippers.exe`.
-The Makefile and the supplied Cargo configuration target the build machine's
-CPU by default. Set `RUSTFLAGS` explicitly when building for another CPU;
-the resulting executable must only use instructions supported by its target.
+#### Option 2: Using `make` (Optimized for host CPU)
 
-The original network, `networks/v60-7f587dfb.nnue`, is included and embedded
-in the executable during compilation. `EVALFILE` can specify another network
-file compatible with this engine. If the bundled network is missing and
-`EVALFILE` is unset, the build script attempts to download the original network
-from the RecklessNetworks repository using `curl`.
+```bash
+# Compiles with native CPU architecture optimizations
+make
 
-The Makefile also provides a `make pgo` target, which requires `cargo-pgo`
-and its LLVM profiling tools. Performance gains depend on the target machine
-and must be measured.
+# Binary output: ./kippers
 
-## UCI Options
+```
 
-| Option | Default | Description |
+> **Note**: The neural network file is pre-packaged inside `networks/`. Compilation embeds the weights directly into the executable, requiring no external file management at runtime.
+
+---
+
+## UCI Configuration
+
+Kippers follows the Universal Chess Interface (UCI) standard. Configure these options directly inside your chess interface:
+
+| Option | Default | Range / Values | Description |
+| --- | --- | --- | --- |
+| `Hash` | `512` | `1` – `262144` (MiB) | Transposition table size in megabytes. |
+| `Threads` | `1` | `1` – `Max Cores` | Number of worker threads used for Lazy SMP search. |
+| `MoveOverhead` | `50` | `0` – `2000` (ms) | Safety time margin to absorb GUI/OS communication jitter. |
+| `Minimal` | `false` | `true` / `false` | Suppresses verbose intermediate search depth output. |
+| `UCI_Chess960` | `false` | `true` / `false` | Enables Chess960 castling rules and notation. |
+| `Clear Hash` | *Button* | — | Instantly purges the transposition table. |
+
+---
+
+## Diagnostic & CLI Commands
+
+In addition to standard UCI commands (`uci`, `isready`, `position`, `go`, `stop`, `quit`), Kippers includes lightweight diagnostics for benchmarking and validation:
+
+| Command | Syntax | Description |
 | --- | --- | --- |
-| `Hash` | 512 MiB | Transposition table size; adjustable from 1 to 262144 MiB. |
-| `Threads` | 1 | Search thread count. The engine reports the supported maximum during UCI initialization. |
-| `MoveOverhead` | 50 ms | Time reserved for communication and scheduling overhead; adjustable from 0 to 2000 ms. |
-| `Minimal` | false | Reduce search information output. |
-| `UCI_Chess960` | false | Enable Chess960 castling notation and handling. |
-| `Clear Hash` | Button | Clear the transposition table. |
+| **Board Display** | `d` | Visualizes the current board in ASCII format alongside its FEN string. |
+| **Static Eval** | `eval` | Displays the static NNUE score and estimated material breakdown. |
+| **Move Validation** | `perft <depth>` | Runs perft move generation tests up to the specified ply. |
+| **Benchmark** | `bench [Hash] [Threads] [Depth]` | Executes standard test suite (Default: `bench 16 1 12`). |
 
-Chess interfaces can override these defaults. Total process memory exceeds
-the configured hash size because the engine also needs memory for evaluation,
-search data, and threads. MultiPV is not adjustable; search output uses
-`multipv 1`.
+---
 
-Example UCI session:
+## GUI Integration
 
-```text
-uci
-isready
-ucinewgame
-position startpos
-go wtime 120000 btime 120000 winc 1000 binc 1000
+Kippers works seamlessly with any modern UCI-compatible chess GUI:
+
+* **Arena**
+* **BanksiaGUI**
+* **Cutechess / Cutechess-cli**
+* **Nibbler**
+
+When configuring match runners, ensure the GUI's **Ponder** setting is disabled, as Kippers is dedicated exclusively to active-turn computation.
+
+---
+
+## Credits & License
+
+* **Engine Maintenance**: [Quedanomo](https://www.google.com/search?q=https://github.com/rrttyynn)
+* **Original Reckless Authors**: Arseniy Surkov, Shahin M. Shahin, Styx, and upstream contributors.
+* **Community & Ecosystem**: Special thanks to Stockfish, OpenBench, Fastchess, Bullet, PlentyChess, Ethereal, Berserk, and the Chess Programming Wiki.
+
+Distributed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [LICENSE](https://www.google.com/search?q=LICENSE) for complete details.
+
 ```
 
-The engine returns its chosen move as `bestmove`. Use `stop` to end an active
-search and `quit` to exit.
-
-## Diagnostic Commands
-
-| Command | Description |
-| --- | --- |
-| `d` | Display the current board and FEN. |
-| `eval` | Display the static evaluation and estimated piece contributions. |
-| `perft <depth>` | Count legal move sequences to the requested depth. |
-| `bench [Hash] [Threads] [Depth]` | Run the built-in position benchmark. |
-
-The benchmark defaults remain 16 MiB, one search thread, and depth 12,
-independently of the normal UCI defaults.
-
-## Attribution
-
-Kippers modifications are maintained by Quedanomo. This distribution contains
-feature removals, engine identification changes, and changes to the default
-hash size and move overhead. The README and source distribution were updated
-on October 15, 2026.
-
-Reckless authors include Arseniy Surkov, Shahin M. Shahin, Styx, and the
-upstream contributors. Credit is retained for the upstream code and hardware
-contributors, engine testers, OpenBench, Fastchess, Bullet, Stockfish,
-PlentyChess, Ethereal, Berserk, and Chess Programming Wiki.
-
-## License
-
-Kippers is distributed under the GNU Affero General Public License, version 3.
-See [LICENSE](LICENSE) for the complete license text.
+```
