@@ -1,4 +1,3 @@
-
 # Kippers
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](LICENSE)
@@ -14,7 +13,7 @@
 
 ## Highlights
 
-- **Embedded NNUE Evaluation**: Comes bundled with verified network weights (`v60-7f587dfb.nnue`). Fully functional out-of-the-box without runtime network downloads.
+- **Embedded NNUE Evaluation**: Embeds evaluation network weights directly into the binary at compile time.
 - **Deterministic Single-PV Search**: Permanently pinned to `MultiPV 1` to eliminate branch dilution and focus computational budget on the critical path.
 - **Lazy SMP Scaling**: Efficient lockless multi-threading scaling from 1 core up to maximum system capacity.
 - **Variant Support**: Native support for both Standard Chess and Chess960 (Fischer Random Chess).
@@ -30,10 +29,9 @@
 - **Rust**: `1.88.0` or higher (`cargo` included)
 - **C Linker**: `gcc`, `clang`, or MSVC
 - **Make** *(optional, for Makefile workflow)*
+- **curl** *(required if network weights are not provided locally)*
 
 ### Building from Source
-
-Clone the repository and build using your preferred method:
 
 #### Option 1: Using `cargo` (Cross-platform)
 
@@ -55,7 +53,18 @@ make
 
 ```
 
-> **Note**: The neural network file is pre-packaged inside `networks/`. Compilation embeds the weights directly into the executable, requiring no external file management at runtime.
+### Network Weights & Offline Builds
+
+During compilation, the build script (`build.rs`) embeds the evaluation network into the executable:
+
+* **Default Behavior**: If `networks/v60-7f587dfb.nnue` is missing, `build.rs` automatically downloads it from the [RecklessNetworks](https://github.com/codedeliveryservice/RecklessNetworks) repository using `curl`.
+* **Offline Build**: To build without internet access, place `v60-7f587dfb.nnue` into the `networks/` folder manually, or specify the file path via the `EVALFILE` environment variable:
+```bash
+EVALFILE=/absolute/path/to/v60-7f587dfb.nnue make
+
+```
+
+
 
 ---
 
@@ -89,7 +98,7 @@ In addition to standard UCI commands (`uci`, `isready`, `position`, `go`, `stop`
 
 ## GUI Integration
 
-Kippers works seamlessly with any modern UCI-compatible chess GUI:
+Kippers works with modern UCI-compatible chess GUIs:
 
 * **Arena**
 * **BanksiaGUI**
@@ -106,7 +115,7 @@ When configuring match runners, ensure the GUI's **Ponder** setting is disabled,
 * **Original Reckless Authors**: Arseniy Surkov, Shahin M. Shahin, Styx, and upstream contributors.
 * **Community & Ecosystem**: Special thanks to Stockfish, OpenBench, Fastchess, Bullet, PlentyChess, Ethereal, Berserk, and the Chess Programming Wiki.
 
-Distributed under the **GNU Affero General Public License v3.0** (AGPL-3.0). See [LICENSE](https://www.google.com/search?q=LICENSE) for complete details.
+Distributed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](https://www.google.com/search?q=LICENSE).
 
 ```
 
