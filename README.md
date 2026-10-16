@@ -116,5 +116,3 @@ When configuring match runners, ensure the GUI's **Ponder** setting is disabled,
 * **Community & Ecosystem**: Special thanks to Stockfish, OpenBench, Fastchess, Bullet, PlentyChess, Ethereal, Berserk, and the Chess Programming Wiki.
 
 Distributed under the [GNU Affero General Public License v3.0 (AGPL-3.0)](https://www.google.com/search?q=LICENSE).
-
-```
